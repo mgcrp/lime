@@ -298,20 +298,16 @@ class LimeImageExplainer(object):
         Args:
             image: 3 dimension RGB image. If this is only two dimensional,
                 we will assume it's a grayscale image and call gray2rgb.
-            classifier_fn: classifier prediction probability function, which
-                takes a numpy array and outputs prediction probabilities.  For
-                ScikitClassifiers , this is classifier.predict_proba.
+            save_dir: string, path to save images for inference
             hide_color: If not None, will hide superpixels with this color.
                 Otherwise, use the mean pixel color of the image.
             num_samples: size of the neighborhood to learn the linear model
-            batch_size: batch size for model predictions
-            distance_metric: the distance metric to use for weights.
             segmentation_fn: SegmentationAlgorithm, wrapped skimage
-            segmentation function
+                segmentation function
+            distance_metric: the distance metric to use for weights.
             random_seed: integer used as random seed for the segmentation
                 algorithm. If None, a random integer, between 0 and 1000,
                 will be generated using the internal random number generator.
-            progress_bar: if True, show tqdm progress bar.
 
         Returns:
             An LimeImageExplainerState object
