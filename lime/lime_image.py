@@ -1,11 +1,13 @@
 """
 Functions for explaining classifiers that use Image data.
 """
+import os
 import copy
 from functools import partial
 
 import numpy as np
 import sklearn
+from PIL import Image
 from sklearn.utils import check_random_state
 from skimage.color import gray2rgb
 from tqdm.auto import tqdm
@@ -13,6 +15,15 @@ from tqdm.auto import tqdm
 
 from . import lime_base
 from .wrappers.scikit_image import SegmentationAlgorithm
+
+
+class LimeImageExplainerState(object):
+    def __init__(self, image, fudged_image, segments, data, distances):
+        self.image = image
+        self.fudged_image = fudged_image
+        self.segments = segments
+        self.data = data
+        self.distances = distances
 
 
 class ImageExplanation(object):
@@ -270,3 +281,178 @@ class LimeImageExplainer(object):
             preds = classifier_fn(np.array(imgs))
             labels.extend(preds)
         return data, np.array(labels)
+    
+    def prepare_for_explanation(self, image, save_dir, labels=(1,),
+                         hide_color=None,
+                         top_labels=5, num_features=100000, num_samples=1000,
+                         segmentation_fn=None,
+                         distance_metric='cosine',
+                         model_regressor=None,
+                         random_seed=42):
+        """Generates explanations for a prediction.
+
+        First, we generate neighborhood data by randomly perturbing features
+        from the instance (see __data_inverse). We then learn locally weighted
+        linear models on this neighborhood data to explain each of the classes
+        in an interpretable way (see lime_base.py).
+
+        Args:
+            image: 3 dimension RGB image. If this is only two dimensional,
+                we will assume it's a grayscale image and call gray2rgb.
+            classifier_fn: classifier prediction probability function, which
+                takes a numpy array and outputs prediction probabilities.  For
+                ScikitClassifiers , this is classifier.predict_proba.
+            labels: iterable with labels to be explained.
+            hide_color: If not None, will hide superpixels with this color.
+                Otherwise, use the mean pixel color of the image.
+            top_labels: if not None, ignore labels and produce explanations for
+                the K labels with highest prediction probabilities, where K is
+                this parameter.
+            num_features: maximum number of features present in explanation
+            num_samples: size of the neighborhood to learn the linear model
+            batch_size: batch size for model predictions
+            distance_metric: the distance metric to use for weights.
+            model_regressor: sklearn regressor to use in explanation. Defaults
+            to Ridge regression in LimeBase. Must have model_regressor.coef_
+            and 'sample_weight' as a parameter to model_regressor.fit()
+            segmentation_fn: SegmentationAlgorithm, wrapped skimage
+            segmentation function
+            random_seed: integer used as random seed for the segmentation
+                algorithm. If None, a random integer, between 0 and 1000,
+                will be generated using the internal random number generator.
+            progress_bar: if True, show tqdm progress bar.
+
+        Returns:
+            An ImageExplanation object (see lime_image.py) with the corresponding
+            explanations.
+        """
+        if len(image.shape) == 2:
+            image = gray2rgb(image)
+        if random_seed is None:
+            random_seed = self.random_state.randint(0, high=1000)
+
+        if segmentation_fn is None:
+            segmentation_fn = SegmentationAlgorithm('quickshift', kernel_size=4,
+                                                    max_dist=200, ratio=0.2,
+                                                    random_seed=random_seed)
+        segments = segmentation_fn(image)
+
+        fudged_image = image.copy()
+        if hide_color is None:
+            for x in np.unique(segments):
+                fudged_image[segments == x] = (
+                    np.mean(image[segments == x][:, 0]),
+                    np.mean(image[segments == x][:, 1]),
+                    np.mean(image[segments == x][:, 2]))
+        else:
+            fudged_image[:] = hide_color
+
+        data = self.generate_and_save_pics(image, fudged_image, segments,
+                                        num_samples, save_dir)
+
+        distances = sklearn.metrics.pairwise_distances(
+            data,
+            data[0].reshape(1, -1),
+            metric=distance_metric
+        ).ravel()
+
+        return LimeImageExplainerState(image, fudged_image, segments, data, distances)
+    
+    def restore_explanation(self, state, probas,
+                            labels=(1,), top_labels=1, num_features=100000,
+                            model_regressor=None):
+        """Generates explanations for a prediction.
+
+        First, we generate neighborhood data by randomly perturbing features
+        from the instance (see __data_inverse). We then learn locally weighted
+        linear models on this neighborhood data to explain each of the classes
+        in an interpretable way (see lime_base.py).
+
+        Args:
+            image: 3 dimension RGB image. If this is only two dimensional,
+                we will assume it's a grayscale image and call gray2rgb.
+            classifier_fn: classifier prediction probability function, which
+                takes a numpy array and outputs prediction probabilities.  For
+                ScikitClassifiers , this is classifier.predict_proba.
+            labels: iterable with labels to be explained.
+            hide_color: If not None, will hide superpixels with this color.
+                Otherwise, use the mean pixel color of the image.
+            top_labels: if not None, ignore labels and produce explanations for
+                the K labels with highest prediction probabilities, where K is
+                this parameter.
+            num_features: maximum number of features present in explanation
+            num_samples: size of the neighborhood to learn the linear model
+            batch_size: batch size for model predictions
+            distance_metric: the distance metric to use for weights.
+            model_regressor: sklearn regressor to use in explanation. Defaults
+            to Ridge regression in LimeBase. Must have model_regressor.coef_
+            and 'sample_weight' as a parameter to model_regressor.fit()
+            segmentation_fn: SegmentationAlgorithm, wrapped skimage
+            segmentation function
+            random_seed: integer used as random seed for the segmentation
+                algorithm. If None, a random integer, between 0 and 1000,
+                will be generated using the internal random number generator.
+            progress_bar: if True, show tqdm progress bar.
+
+        Returns:
+            An ImageExplanation object (see lime_image.py) with the corresponding
+            explanations.
+        """
+        image = state.image
+        segments = state.segments
+        data = state.data
+        distances = state.distances
+    
+        top = labels
+        labels = probas
+
+        ret_exp = ImageExplanation(image, segments)
+        if top_labels:
+            top = np.argsort(labels[0])[-top_labels:]
+            ret_exp.top_labels = list(top)
+            ret_exp.top_labels.reverse()
+        for label in top:
+            (ret_exp.intercept[label],
+             ret_exp.local_exp[label],
+             ret_exp.score[label],
+             ret_exp.local_pred[label]) = self.base.explain_instance_with_data(
+                data, labels, distances, label, num_features,
+                model_regressor=model_regressor,
+                feature_selection=self.feature_selection)
+        return ret_exp
+    
+    def generate_and_save_pics(self,
+                    image,
+                    fudged_image,
+                    segments,
+                    num_samples,
+                    save_dir):
+        """Generates images and predictions in the neighborhood of this image.
+
+        Args:
+            image: 3d numpy array, the image
+            fudged_image: 3d numpy array, image to replace original image when
+                superpixel is turned off
+            segments: segmentation of the image
+            num_samples: size of the neighborhood to learn the linear model
+            save_dir: directory to save pictures.
+
+        Returns:
+            data: dense num_samples * num_superpixels
+        """
+        n_features = np.unique(segments).shape[0]
+        data = self.random_state.randint(0, 2, num_samples * n_features)\
+            .reshape((num_samples, n_features))
+        data[0, :] = 1
+
+        for n, row in enumerate(data):
+            temp = copy.deepcopy(image)
+            zeros = np.where(row == 0)[0]
+            mask = np.zeros(segments.shape).astype(bool)
+            for z in zeros:
+                mask[segments == z] = True
+            temp[mask] = fudged_image[mask]
+            im = Image.fromarray(temp)
+            im.save(os.path.join(save_dir, f'image_{n:07d}.png'))
+        
+        return data
